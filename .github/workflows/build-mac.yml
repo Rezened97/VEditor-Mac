@@ -26,12 +26,18 @@ jobs:
         run: |
           pyinstaller --windowed --clean --name vid6 --additional-hooks-dir=. vid6.py
 
-      - name: Show dist contents
+      - name: Verify app bundle exists
         run: |
-          ls -R dist
+          test -d "dist/vid6.app"
+          test -f "dist/vid6.app/Contents/Info.plist"
 
-      - name: Upload .app artifact
+      - name: Zip the .app bundle properly
+        run: |
+          cd dist
+          ditto -c -k --sequesterRsrc --keepParent vid6.app vid6-macos-app.zip
+
+      - name: Upload zipped .app artifact
         uses: actions/upload-artifact@v6
         with:
           name: vid6-macos-app
-          path: dist/vid6.app
+          path: dist/vid6-macos-app.zip
