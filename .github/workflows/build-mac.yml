@@ -1,4 +1,4 @@
-name: Build macOS .app
+name: Build macOS .pkg
 
 on:
   workflow_dispatch:
@@ -31,13 +31,19 @@ jobs:
           test -d "dist/vid6.app"
           test -f "dist/vid6.app/Contents/Info.plist"
 
-      - name: Zip the .app bundle properly
+      - name: Build .pkg installer
         run: |
-          cd dist
-          ditto -c -k --sequesterRsrc --keepParent vid6.app vid6-macos-app.zip
+          pkgbuild \
+            --component "dist/vid6.app" \
+            --install-location "/Applications" \
+            "dist/vid6-macos-installer.pkg"
 
-      - name: Upload zipped .app artifact
+      - name: Verify .pkg exists
+        run: |
+          test -f "dist/vid6-macos-installer.pkg"
+
+      - name: Upload .pkg artifact
         uses: actions/upload-artifact@v6
         with:
-          name: vid6-macos-app
-          path: dist/vid6-macos-app.zip
+          name: vid6-macos-pkg
+          path: dist/vid6-macos-installer.pkg
