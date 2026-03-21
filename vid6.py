@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+import math
 import subprocess
 from pathlib import Path
 from itertools import product
@@ -104,7 +105,6 @@ def adjust_audio_speed(audio: Path, target_duration: float) -> Path:
 
 
 def ffconcat_escape(path: Path) -> str:
-    # Escape dei singoli apici per il file ffconcat
     return str(path.resolve().as_posix()).replace("'", r"'\''")
 
 
@@ -115,8 +115,220 @@ def write_ffconcat_file(inputs, list_file: Path):
             f.write(f"file '{ffconcat_escape(p)}'\n")
 
 
-# -------- Process functions (Concat diretto, veloce, qualità identica) --------
+def get_stream_signature(path: Path):
+    cmd = [ffmpeg_bin, '-hide_banner', '-i', str(path)]
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        startupinfo=STARTUPINFO
+    )
+    _, err = proc.communicate()
+    text = err.decode(errors='ignore')
+
+    video_lines = re.findall(r"Stream #\d+:\d+(?:\([^)]+\))?: Video: ([^\n\r]+)", text)
+    audio_lines = re.findall(r"Stream #\d+:\d+(?:\([^)]+\))?: Audio: ([^\n\r]+)", text)
+
+    sig = {
+        'video_streams': len(video_lines),
+        'audio_streams': len(audio_lines),
+        'video_codec': None,
+        'width': None,
+        'height': None,
+        'fps': None,
+        'tbn': None,
+        'audio_codec': None,
+        'sample_rate': None,
+        'channels': None,
+    }
+
+    if video_lines:
+        v = video_lines[0]
+        sig['video_codec'] = v.split(',')[0].strip().lower()
+
+        m_res = re.search(r'(\d{2,5})x(\d{2,5})', v)
+        if m_res:
+            sig['width'] = int(m_res.group(1))
+            sig['height'] = int(m_res.group(2))
+
+        m_fps = re.search(r'(\d+(?:\.\d+)?)\s+fps', v)
+        if m_fps:
+            sig['fps'] = float(m_fps.group(1))
+
+        m_tbn = re.search(r'(\d+(?:\.\d+)?)\s+tbn', v)
+        if m_tbn:
+            try:
+                sig['tbn'] = float(m_tbn.group(1))
+            except ValueError:
+                sig['tbn'] = None
+
+    if audio_lines:
+        a = audio_lines[0]
+        sig['audio_codec'] = a.split(',')[0].strip().lower()
+
+        m_sr = re.search(r'(\d+)\s+Hz', a)
+        if m_sr:
+            sig['sample_rate'] = int(m_sr.group(1))
+
+        for ch in ('mono', 'stereo', '5.1', '7.1'):
+            if re.search(rf'\b{re.escape(ch)}\b', a):
+                sig['channels'] = ch
+                break
+
+        if sig['channels'] is None:
+            m_ch = re.search(r'(\d+)\s+channels?', a)
+            if m_ch:
+                sig['channels'] = m_ch.group(1)
+
+    return sig
+
+
+def approx_equal(a, b, tol=0.01):
+    if a is None or b is None:
+        return a == b
+    return math.isclose(a, b, abs_tol=tol)
+
+
+def can_fast_concat(inputs, expect_audio: bool):
+    if not inputs:
+        return False
+
+    base = get_stream_signature(inputs[0])
+
+    if base['video_streams'] != 1 or base['video_codec'] is None:
+        return False
+
+    if expect_audio:
+        if base['audio_streams'] != 1 or base['audio_codec'] is None:
+            return False
+
+    for p in inputs[1:]:
+        cur = get_stream_signature(p)
+
+        if cur['video_streams'] != base['video_streams']:
+            return False
+        if cur['video_codec'] != base['video_codec']:
+            return False
+        if cur['width'] != base['width'] or cur['height'] != base['height']:
+            return False
+        if not approx_equal(cur['fps'], base['fps'], 0.05):
+            return False
+        if not approx_equal(cur['tbn'], base['tbn'], 1.0):
+            return False
+
+        if expect_audio:
+            if cur['audio_streams'] != base['audio_streams']:
+                return False
+            if cur['audio_codec'] != base['audio_codec']:
+                return False
+            if cur['sample_rate'] != base['sample_rate']:
+                return False
+            if cur['channels'] != base['channels']:
+                return False
+
+    return True
+
+
+def get_fallback_target(inputs):
+    sig = get_stream_signature(inputs[0])
+    width = sig['width'] or 1080
+    height = sig['height'] or 1920
+    fps = sig['fps'] or 30.0
+    return width, height, fps
+
+
+# -------- Process functions --------
+def process_concat_internal_fallback(inputs, output: Path):
+    width, height, fps = get_fallback_target(inputs)
+
+    cmd = [ffmpeg_bin, '-y']
+    for p in inputs:
+        cmd += ['-i', str(p)]
+
+    parts = []
+    concat_inputs = []
+
+    for i in range(len(inputs)):
+        parts.append(
+            f'[{i}:v:0]fps={fps},scale={width}:{height}:flags=lanczos,format=yuv420p,setsar=1[v{i}]'
+        )
+        parts.append(
+            f'[{i}:a:0]aresample=44100,'
+            f'aformat=sample_fmts=fltp:sample_rates=44100:channel_layouts=stereo[a{i}]'
+        )
+        concat_inputs.append(f'[v{i}][a{i}]')
+
+    parts.append(''.join(concat_inputs) + f'concat=n={len(inputs)}:v=1:a=1[v][a]')
+
+    cmd += [
+        '-filter_complex', ';'.join(parts),
+        '-map', '[v]',
+        '-map', '[a]',
+        '-c:v', 'libx264',
+        '-preset', 'veryfast',
+        '-crf', '18',
+        '-pix_fmt', 'yuv420p',
+        '-c:a', 'aac',
+        '-b:a', '192k',
+        '-ar', '44100',
+        '-ac', '2',
+        '-movflags', '+faststart',
+        str(output)
+    ]
+
+    subprocess.run(cmd, check=True, startupinfo=STARTUPINFO)
+
+
+def process_concat_external_fallback(inputs, audio: Path, output: Path):
+    width, height, fps = get_fallback_target(inputs)
+    total_dur = sum(get_media_duration(p) for p in inputs)
+    adj_audio = adjust_audio_speed(audio, total_dur)
+
+    try:
+        cmd = [ffmpeg_bin, '-y']
+        for p in inputs:
+            cmd += ['-i', str(p)]
+        cmd += ['-i', str(adj_audio)]
+
+        parts = []
+        concat_inputs = []
+
+        for i in range(len(inputs)):
+            parts.append(
+                f'[{i}:v:0]fps={fps},scale={width}:{height}:flags=lanczos,format=yuv420p,setsar=1[v{i}]'
+            )
+            concat_inputs.append(f'[v{i}]')
+
+        parts.append(''.join(concat_inputs) + f'concat=n={len(inputs)}:v=1:a=0[v]')
+
+        cmd += [
+            '-filter_complex', ';'.join(parts),
+            '-map', '[v]',
+            '-map', f'{len(inputs)}:a:0',
+            '-c:v', 'libx264',
+            '-preset', 'veryfast',
+            '-crf', '18',
+            '-pix_fmt', 'yuv420p',
+            '-c:a', 'aac',
+            '-b:a', '192k',
+            '-ar', '44100',
+            '-ac', '2',
+            '-movflags', '+faststart',
+            '-shortest',
+            str(output)
+        ]
+
+        subprocess.run(cmd, check=True, startupinfo=STARTUPINFO)
+    finally:
+        if adj_audio != audio:
+            safe_unlink(adj_audio)
+
+
 def process_concat_internal(inputs, output: Path):
+    if not can_fast_concat(inputs, expect_audio=True):
+        process_concat_internal_fallback(inputs, output)
+        return
+
     list_file = output.with_name(f"{output.stem}_list.ffconcat")
     write_ffconcat_file(inputs, list_file)
 
@@ -138,6 +350,10 @@ def process_concat_internal(inputs, output: Path):
 
 
 def process_concat_external(inputs, audio: Path, output: Path):
+    if not can_fast_concat(inputs, expect_audio=False):
+        process_concat_external_fallback(inputs, audio, output)
+        return
+
     list_file = output.with_name(f"{output.stem}_list.ffconcat")
     temp_vid = output.with_name(f"{output.stem}_video_only.mp4")
     adj_audio = audio
@@ -145,7 +361,6 @@ def process_concat_external(inputs, audio: Path, output: Path):
     write_ffconcat_file(inputs, list_file)
 
     try:
-        # Concat diretto dei video originali mantenendo il video identico
         cmd_concat = [
             ffmpeg_bin, '-y',
             '-fflags', '+genpts',
@@ -163,7 +378,6 @@ def process_concat_external(inputs, audio: Path, output: Path):
         total_dur = sum(get_media_duration(p) for p in inputs)
         adj_audio = adjust_audio_speed(audio, total_dur)
 
-        # Mux finale: video copiato, audio convertito in AAC, output MP4 più compatibile
         cmd_mux = [
             ffmpeg_bin, '-y',
             '-i', str(temp_vid),
@@ -551,7 +765,7 @@ class MontageGUI(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
 
         try:
             self.run_btn.config(state='disabled')
-            self.log("Avvio del processo con concat diretto + faststart...")
+            self.log("Avvio del processo con controllo automatico compatibilità clip...")
 
             for combo in combos:
                 if use_lead:
@@ -578,7 +792,12 @@ class MontageGUI(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
                     name += f"_audio{a.index(audio) + 1}"
 
                 out_path = self.output_dir / f"{name}.mp4"
-                self.log(f"Elaborazione: {name}.mp4")
+
+                sig_ok = can_fast_concat(inputs, expect_audio=not use_external_audio)
+                if sig_ok:
+                    self.log(f"Elaborazione: {name}.mp4 [fast copy]")
+                else:
+                    self.log(f"Elaborazione: {name}.mp4 [fallback sicuro]")
 
                 if use_external_audio:
                     process_concat_external(inputs, audio, out_path)
@@ -588,7 +807,7 @@ class MontageGUI(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
                 count += 1
 
             self.log("✅ PROCESSO COMPLETATO!")
-            messagebox.showinfo("Completato", f"Generati {count - 1} video in tempo record!")
+            messagebox.showinfo("Completato", f"Generati {count - 1} video con controllo automatico!")
 
         except subprocess.CalledProcessError as e:
             self.log("❌ ERRORE FFMPEG!")
