@@ -47,10 +47,23 @@ FONT_TITLE = ('Segoe UI', 12, 'bold')
 FONT_LOG = ('Consolas', 9)
 
 
-# -------- Helpers per durata e speed --------
+# -------- Helpers --------
+def safe_unlink(path: Path):
+    try:
+        if path.exists():
+            path.unlink()
+    except OSError:
+        pass
+
+
 def get_media_duration(path: Path) -> float:
     cmd = [ffmpeg_bin, '-i', str(path)]
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, startupinfo=STARTUPINFO)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        startupinfo=STARTUPINFO
+    )
     _, err = proc.communicate()
     text = err.decode(errors='ignore')
     m = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", text)
@@ -80,101 +93,100 @@ def adjust_audio_speed(audio: Path, target_duration: float) -> Path:
     filt = ','.join(filters)
 
     out_file = audio.with_name(f"{audio.stem}_adj{audio.suffix}")
-    cmd = [ffmpeg_bin, '-y', '-i', str(audio), '-filter:a', filt, str(out_file)]
+    cmd = [
+        ffmpeg_bin, '-y',
+        '-i', str(audio),
+        '-filter:a', filt,
+        str(out_file)
+    ]
     subprocess.run(cmd, check=True, startupinfo=STARTUPINFO)
     return out_file
 
 
-# -------- Process functions (Metodo TS: Veloce e Senza Blocchi) --------
+def ffconcat_escape(path: Path) -> str:
+    # Escape dei singoli apici per il file ffconcat
+    return str(path.resolve().as_posix()).replace("'", r"'\''")
+
+
+def write_ffconcat_file(inputs, list_file: Path):
+    with open(list_file, 'w', encoding='utf-8', newline='\n') as f:
+        f.write("ffconcat version 1.0\n")
+        for p in inputs:
+            f.write(f"file '{ffconcat_escape(p)}'\n")
+
+
+# -------- Process functions (Concat diretto, veloce, qualità identica) --------
 def process_concat_internal(inputs, output: Path):
-    temp_ts_files = []
+    list_file = output.with_name(f"{output.stem}_list.ffconcat")
+    write_ffconcat_file(inputs, list_file)
 
-    for i, p in enumerate(inputs):
-        ts = output.with_name(f"{output.stem}_temp_{i}.ts")
-        cmd = [
-            ffmpeg_bin, '-y', '-i', str(p),
-            '-c:v', 'copy',
-            '-c:a', 'aac', '-ar', '44100', '-ac', '2',
-            '-f', 'mpegts', str(ts)
+    try:
+        cmd_concat = [
+            ffmpeg_bin, '-y',
+            '-fflags', '+genpts',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', str(list_file),
+            '-c', 'copy',
+            '-movflags', '+faststart',
+            '-avoid_negative_ts', 'make_zero',
+            str(output)
         ]
-        subprocess.run(cmd, check=True, startupinfo=STARTUPINFO)
-        temp_ts_files.append(ts)
-
-    list_file = output.with_name(f"{output.stem}_list.txt")
-    with open(list_file, 'w', encoding='utf-8') as f:
-        for ts in temp_ts_files:
-            f.write(f"file '{ts.resolve().as_posix()}'\n")
-
-    cmd_concat = [
-        ffmpeg_bin, '-y', '-f', 'concat', '-safe', '0',
-        '-i', str(list_file),
-        '-c', 'copy',
-        str(output)
-    ]
-    subprocess.run(cmd_concat, check=True, startupinfo=STARTUPINFO)
-
-    if list_file.exists():
-        list_file.unlink()
-    for ts in temp_ts_files:
-        if ts.exists():
-            ts.unlink()
+        subprocess.run(cmd_concat, check=True, startupinfo=STARTUPINFO)
+    finally:
+        safe_unlink(list_file)
 
 
 def process_concat_external(inputs, audio: Path, output: Path):
-    temp_ts_files = []
+    list_file = output.with_name(f"{output.stem}_list.ffconcat")
+    temp_vid = output.with_name(f"{output.stem}_video_only.mp4")
+    adj_audio = audio
 
-    for i, p in enumerate(inputs):
-        ts = output.with_name(f"{output.stem}_temp_{i}.ts")
-        cmd = [
-            ffmpeg_bin, '-y', '-i', str(p),
+    write_ffconcat_file(inputs, list_file)
+
+    try:
+        # Concat diretto dei video originali mantenendo il video identico
+        cmd_concat = [
+            ffmpeg_bin, '-y',
+            '-fflags', '+genpts',
+            '-f', 'concat',
+            '-safe', '0',
+            '-i', str(list_file),
+            '-map', '0:v:0',
             '-c:v', 'copy',
-            '-an',
-            '-f', 'mpegts', str(ts)
+            '-movflags', '+faststart',
+            '-avoid_negative_ts', 'make_zero',
+            str(temp_vid)
         ]
-        subprocess.run(cmd, check=True, startupinfo=STARTUPINFO)
-        temp_ts_files.append(ts)
+        subprocess.run(cmd_concat, check=True, startupinfo=STARTUPINFO)
 
-    list_file = output.with_name(f"{output.stem}_list.txt")
-    with open(list_file, 'w', encoding='utf-8') as f:
-        for ts in temp_ts_files:
-            f.write(f"file '{ts.resolve().as_posix()}'\n")
+        total_dur = sum(get_media_duration(p) for p in inputs)
+        adj_audio = adjust_audio_speed(audio, total_dur)
 
-    temp_vid = output.with_name(f"{output.stem}_v.mp4")
-    cmd_concat = [
-        ffmpeg_bin, '-y', '-f', 'concat', '-safe', '0',
-        '-i', str(list_file),
-        '-c', 'copy',
-        str(temp_vid)
-    ]
-    subprocess.run(cmd_concat, check=True, startupinfo=STARTUPINFO)
+        # Mux finale: video copiato, audio convertito in AAC, output MP4 più compatibile
+        cmd_mux = [
+            ffmpeg_bin, '-y',
+            '-i', str(temp_vid),
+            '-i', str(adj_audio),
+            '-map', '0:v:0',
+            '-map', '1:a:0',
+            '-c:v', 'copy',
+            '-c:a', 'aac',
+            '-b:a', '192k',
+            '-ar', '44100',
+            '-ac', '2',
+            '-movflags', '+faststart',
+            '-avoid_negative_ts', 'make_zero',
+            '-shortest',
+            str(output)
+        ]
+        subprocess.run(cmd_mux, check=True, startupinfo=STARTUPINFO)
 
-    total_dur = sum(get_media_duration(p) for p in inputs)
-    adj_audio = adjust_audio_speed(audio, total_dur)
-
-    subprocess.run([
-        ffmpeg_bin, '-y',
-        '-i', str(temp_vid),
-        '-i', str(adj_audio),
-        '-map', '0:v:0',
-        '-map', '1:a:0',
-        '-c:v', 'copy',
-        '-c:a', 'aac',
-        '-shortest',
-        str(output)
-    ], check=True, startupinfo=STARTUPINFO)
-
-    if list_file.exists():
-        list_file.unlink()
-    if temp_vid.exists():
-        temp_vid.unlink()
-    if adj_audio != audio and adj_audio.exists():
-        try:
-            adj_audio.unlink()
-        except OSError:
-            pass
-    for ts in temp_ts_files:
-        if ts.exists():
-            ts.unlink()
+    finally:
+        safe_unlink(list_file)
+        safe_unlink(temp_vid)
+        if adj_audio != audio:
+            safe_unlink(adj_audio)
 
 
 # -------- GUI classes --------
@@ -539,7 +551,7 @@ class MontageGUI(TkinterDnD.Tk if DND_AVAILABLE else tk.Tk):
 
         try:
             self.run_btn.config(state='disabled')
-            self.log("Avvio del processo con fix Anti-Blocco (Modalità Veloce)...")
+            self.log("Avvio del processo con concat diretto + faststart...")
 
             for combo in combos:
                 if use_lead:
